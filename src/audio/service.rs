@@ -129,19 +129,25 @@ fn node_id() -> Option<String> {
     None
 }
 
+/// Máximo de pares nome/valor por chamada do `pw-cli s … Props`.
+const PARAMS_PER_CALL: usize = 12;
+
 /// Sets filter controls on the running graph without restarting it.
 fn set_params(params: &[(String, f32)]) -> Result<()> {
     let id = node_id().context("sink do PulseForge não encontrado no PipeWire")?;
-    let list: Vec<String> = params
-        .iter()
-        .map(|(name, value)| format!("\"{name}\" {value:.6}"))
-        .collect();
-    let status = Command::new("pw-cli")
-        .args(["s", &id, "Props", &format!("{{ params = [ {} ] }}", list.join(" "))])
-        .output()
-        .context("pw-cli indisponível")?;
-    if !status.status.success() || !status.stderr.is_empty() {
-        anyhow::bail!("pw-cli não aplicou os parâmetros");
+    // O pw-cli ignora em silêncio listas com mais de ~20 pares: aplica em lotes.
+    for batch in params.chunks(PARAMS_PER_CALL) {
+        let list: Vec<String> = batch
+            .iter()
+            .map(|(name, value)| format!("\"{name}\" {value:.6}"))
+            .collect();
+        let status = Command::new("pw-cli")
+            .args(["s", &id, "Props", &format!("{{ params = [ {} ] }}", list.join(" "))])
+            .output()
+            .context("pw-cli indisponível")?;
+        if !status.status.success() || !status.stderr.is_empty() {
+            anyhow::bail!("pw-cli não aplicou os parâmetros");
+        }
     }
     Ok(())
 }
