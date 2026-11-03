@@ -1,4 +1,5 @@
-//! Interface GTK4/libadwaita do PulseForge (estilo "mesa de som").
+//! Interface GTK4/libadwaita do PulseForge (estilo "estúdio": barra lateral
+//! de perfis, curva, medidor L/R, faders e knobs).
 //!
 //! Edição ao vivo: os controles alteram um *rascunho* do perfil e o áudio é
 //! atualizado em seguida; o perfil salvo só muda em "Salvar". O balanço L/R é
@@ -6,12 +7,15 @@
 
 mod curve;
 mod dialogs;
+mod knob;
+mod meter;
 mod style;
 
 use crate::audio::{backend::AudioBackend, response, service::FilterService, service::balance_gains};
 use crate::config::model::{AppConfig, Profile};
 use adw::prelude::*;
 use gtk4 as gtk;
+use knob::Knob;
 use libadwaita as adw;
 use std::{
     cell::{Cell, RefCell},
@@ -41,6 +45,13 @@ pub fn run(start_minimized: bool) {
     app.run_with_args(&["pulseforge"]);
 }
 
+type Points = Rc<RefCell<Vec<(f64, f64)>>>;
+
+struct Thumb {
+    points: Points,
+    area: gtk::DrawingArea,
+}
+
 struct Ui {
     window: adw::ApplicationWindow,
     config: RefCell<AppConfig>,
@@ -51,22 +62,22 @@ struct Ui {
     balance_gen: Cell<u64>,
     outputs: Vec<String>,
 
-    profile: gtk::DropDown,
-    profile_model: gtk::StringList,
+    list: gtk::ListBox,
+    thumbs: RefCell<Vec<Thumb>>,
+    title: gtk::Label,
     output: gtk::DropDown,
     bypass: gtk::ToggleButton,
     menu_buttons: Vec<gtk::Button>,
 
-    preamp: gtk::Scale,
-    preamp_value: gtk::Label,
+    preamp: Rc<Knob>,
+    preamp_text: gtk::Label,
     bands: Vec<gtk::Scale>,
     band_values: Vec<gtk::Label>,
     limiter: gtk::Switch,
     headroom: gtk::Label,
 
-    balance: gtk::Scale,
-    balance_l: gtk::Label,
-    balance_r: gtk::Label,
+    balance_text: gtk::Label,
+    meter: meter::Meter,
 
     dirty_label: gtk::Label,
     undo: gtk::Button,
@@ -104,13 +115,11 @@ fn same_profile(a: &Profile, b: &Profile) -> bool {
             .all(|(x, y)| (x.gain_db - y.gain_db).abs() < EPS)
 }
 
-fn set_tone(label: &gtk::Label, value: f64, preamp: bool) {
-    label.remove_css_class("zero");
-    label.remove_css_class("preamp");
-    if preamp {
-        label.add_css_class("preamp");
-    } else if value.abs() < 0.05 {
+fn set_tone(label: &gtk::Label, value: f64) {
+    if value.abs() < 0.05 {
         label.add_css_class("zero");
+    } else {
+        label.remove_css_class("zero");
     }
 }
 
@@ -120,19 +129,53 @@ fn card() -> gtk::Box {
     b
 }
 
-fn fader(min: f64, max: f64, css: Option<&str>) -> gtk::Scale {
-    let s = gtk::Scale::with_range(gtk::Orientation::Vertical, min, max, 0.1);
+fn section(text: &str) -> gtk::Label {
+    let l = gtk::Label::new(Some(text));
+    l.add_css_class("section");
+    l.set_halign(gtk::Align::Start);
+    l
+}
+
+fn fader() -> gtk::Scale {
+    let s = gtk::Scale::with_range(gtk::Orientation::Vertical, -12.0, 12.0, 0.1);
     s.set_inverted(true);
     s.set_vexpand(true);
     s.set_draw_value(false);
     s.set_round_digits(1);
-    s.set_size_request(34, 200);
+    s.set_size_request(34, 150);
     s.add_css_class("fader");
-    if let Some(c) = css {
-        s.add_css_class(c);
-    }
     s.add_mark(0.0, gtk::PositionType::Right, None);
     s
+}
+
+fn thumb_points(profile: &Profile) -> Vec<(f64, f64)> {
+    response::curve(profile, 48, curve::MIN_HZ, curve::MAX_HZ)
+}
+
+fn thumb_area(points: Points) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder().content_height(18).hexpand(true).build();
+    area.set_draw_func(move |_, cr, w, h| {
+        let (w, h) = (f64::from(w), f64::from(h));
+        let pts = points.borrow();
+        if pts.len() < 2 {
+            return;
+        }
+        let x = |f: f64| (f.ln() - curve::MIN_HZ.ln()) / (curve::MAX_HZ.ln() - curve::MIN_HZ.ln()) * w;
+        let y = |db: f64| h / 2.0 - db.clamp(-12.0, 12.0) / 12.0 * (h / 2.0 - 1.0);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.08);
+        cr.set_line_width(1.0);
+        cr.move_to(0.0, y(0.0));
+        cr.line_to(w, y(0.0));
+        let _ = cr.stroke();
+        cr.set_source_rgba(0.24, 0.86, 0.72, 0.9);
+        cr.set_line_width(1.5);
+        cr.move_to(x(pts[0].0), y(pts[0].1));
+        for (f, db) in &pts[1..] {
+            cr.line_to(x(*f), y(*db));
+        }
+        let _ = cr.stroke();
+    });
+    area
 }
 
 impl Ui {
@@ -159,11 +202,12 @@ impl Ui {
     /// Atualiza rótulos, curva, headroom e estado dos botões a partir do rascunho.
     fn refresh_view(&self) {
         let draft = self.draft.borrow();
-        self.preamp_value.set_text(&db_text(f64::from(draft.preamp_db)));
-        set_tone(&self.preamp_value, 0.0, true);
+        self.title.set_text(&draft.name);
+        self.preamp_text
+            .set_text(&format!("PRÉ-AMP · {} dB", db_text(f64::from(draft.preamp_db))));
         for (band, label) in draft.bands.iter().zip(&self.band_values) {
             label.set_text(&db_text(f64::from(band.gain_db)));
-            set_tone(label, f64::from(band.gain_db), false);
+            set_tone(label, f64::from(band.gain_db));
         }
 
         let peak = draft
@@ -202,20 +246,15 @@ impl Ui {
                 })
                 .collect();
         }
+        if let Some(t) = self.thumbs.borrow().get(self.current.get()) {
+            *t.points.borrow_mut() = thumb_points(&draft);
+            t.area.queue_draw();
+        }
         drop(draft);
         self.curve_area.queue_draw();
 
         let dirty = self.dirty();
-        self.dirty_label.set_text(if dirty {
-            "● Alterações não salvas"
-        } else {
-            "Sem alterações"
-        });
-        if dirty {
-            self.dirty_label.add_css_class("dirty");
-        } else {
-            self.dirty_label.remove_css_class("dirty");
-        }
+        self.dirty_label.set_text(if dirty { "● não salvo" } else { "" });
         self.undo.set_sensitive(dirty);
         self.save.set_sensitive(dirty);
         for b in &self.menu_buttons {
@@ -226,6 +265,15 @@ impl Ui {
                 None
             });
         }
+    }
+
+    fn update_balance_text(&self, v: f64) {
+        let (l, r) = balance_gains(v);
+        self.balance_text.set_text(&format!(
+            "BALANÇO · L {}% · R {}%",
+            (l * 100.0).round() as i32,
+            (r * 100.0).round() as i32
+        ));
     }
 
     /// Copia o rascunho para os widgets sem disparar edições.
@@ -253,16 +301,33 @@ impl Ui {
         self.apply_now();
     }
 
-    fn select_dropdown(&self, index: usize) {
+    fn select_row(&self, index: usize) {
         self.loading.set(true);
-        self.profile.set_selected(index as u32);
+        self.list.select_row(self.list.row_at_index(index as i32).as_ref());
         self.loading.set(false);
     }
 
-    fn reload_model(&self, select: usize) {
+    /// Reconstrói a lista de perfis (miniaturas incluídas) e seleciona `select`.
+    fn reload_list(&self, select: usize) {
         self.loading.set(true);
-        dialogs::refresh_profile_model(&self.profile_model, &self.config.borrow());
-        self.profile.set_selected(select as u32);
+        while let Some(row) = self.list.first_child() {
+            self.list.remove(&row);
+        }
+        let mut thumbs = Vec::new();
+        for p in &self.config.borrow().profiles {
+            let points: Points = Rc::new(RefCell::new(thumb_points(p)));
+            let area = thumb_area(Rc::clone(&points));
+            let name = gtk::Label::new(Some(&p.name));
+            name.set_halign(gtk::Align::Start);
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            content.append(&name);
+            content.append(&area);
+            self.list.append(&content);
+            thumbs.push(Thumb { points, area });
+        }
+        *self.thumbs.borrow_mut() = thumbs;
+        self.list.select_row(self.list.row_at_index(select as i32).as_ref());
         self.loading.set(false);
     }
 
@@ -322,14 +387,8 @@ impl Ui {
         }
     }
 
-    fn balance_changed(self: &Rc<Self>) {
-        let v = self.balance.value();
-        let (l, r) = balance_gains(v);
-        self.balance_l.set_text(&format!("L {}%", (l * 100.0).round() as i32));
-        self.balance_r.set_text(&format!("R {}%", (r * 100.0).round() as i32));
-        if self.loading.get() {
-            return;
-        }
+    fn balance_changed(self: &Rc<Self>, v: f64) {
+        self.update_balance_text(v);
         self.config.borrow_mut().balance = v as f32;
         if !self.bypass.is_active() {
             if let Err(e) = FilterService::new().and_then(|s| s.set_balance(v)) {
@@ -349,8 +408,7 @@ impl Ui {
         );
     }
 
-    fn profile_selected(self: &Rc<Self>) {
-        let sel = self.profile.selected() as usize;
+    fn profile_selected(self: &Rc<Self>, sel: usize) {
         if self.loading.get() || sel == self.current.get() {
             return;
         }
@@ -359,7 +417,7 @@ impl Ui {
             return;
         }
         // Volta a seleção e pergunta antes de descartar.
-        self.select_dropdown(self.current.get());
+        self.select_row(self.current.get());
         let name = self
             .config
             .borrow()
@@ -380,8 +438,10 @@ impl Ui {
         dialog.set_close_response("keep");
         let ui = Rc::clone(self);
         dialog.connect_response(Some("discard"), move |_, _| {
-            ui.select_dropdown(sel);
+            // Restaura a miniatura do perfil descartado antes de trocar.
+            ui.select_row(sel);
             ui.load_profile(sel);
+            ui.reload_list(sel);
         });
         dialog.present();
     }
@@ -420,14 +480,14 @@ impl Ui {
                 button.set_label("Atualizar");
                 button.set_tooltip_text(Some(&error));
                 let short: String = error.chars().take(80).collect();
-                let toast = adw::MessageDialog::builder()
+                let info = adw::MessageDialog::builder()
                     .transient_for(&window)
                     .modal(true)
                     .heading("Atualização")
                     .body(short)
                     .build();
-                toast.add_response("ok", "OK");
-                toast.present();
+                info.add_response("ok", "OK");
+                info.present();
                 gtk::glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
@@ -438,6 +498,14 @@ impl Ui {
             }
         });
     }
+}
+
+fn knob_column(knob: &Rc<Knob>, text: &gtk::Label) -> gtk::Box {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    text.add_css_class("freq");
+    b.append(knob.widget());
+    b.append(text);
+    b
 }
 
 fn build_window(app: &adw::Application, start_minimized: bool) {
@@ -473,36 +541,37 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         .cloned()
         .unwrap_or_else(|| AppConfig::default().profiles.remove(0));
 
-    // ---- Cabeçalho ----
-    let names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
-    let profile_model = gtk::StringList::new(&names);
-    let profile = gtk::DropDown::new(Some(profile_model.clone()), None::<&gtk::Expression>);
-    profile.set_selected(initial_idx as u32);
-    profile.set_tooltip_text(Some("Perfil de equalização"));
-
-    let output_names: Vec<&str> = outputs.iter().map(|s| s.name.as_str()).collect();
-    let output = gtk::DropDown::from_strings(&output_names);
-    output.set_size_request(260, -1);
-    output.set_tooltip_text(Some("Saída de áudio"));
-    if let Some(i) = default_output
-        .as_ref()
-        .and_then(|d| outputs.iter().position(|s| s.name == d.name))
-    {
-        output.set_selected(i as u32);
-    }
-
+    // ---- Cabeçalho (janela) ----
     let bypass = gtk::ToggleButton::with_label("Bypass");
     bypass.set_tooltip_text(Some("Desliga o equalizador (áudio sem processamento)"));
     let update = gtk::Button::with_label("Atualizar");
     update.set_tooltip_text(Some("Procurar nova versão no GitHub"));
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&gtk::Label::new(None)));
+    header.pack_end(&bypass);
+    header.pack_end(&update);
 
-    let btn_new = gtk::Button::with_label("Novo perfil");
+    // ---- Barra lateral ----
+    let brand = gtk::Label::new(Some("PulseForge"));
+    brand.add_css_class("title-pf");
+    brand.set_halign(gtk::Align::Start);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.add_css_class("profiles");
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+
+    let btn_new = gtk::Button::with_label("＋ Novo perfil");
+    btn_new.set_hexpand(true);
     let btn_dup = gtk::Button::with_label("Duplicar");
     let btn_ren = gtk::Button::with_label("Renomear");
     let btn_del = gtk::Button::with_label("Excluir");
     let menu_buttons = vec![btn_new.clone(), btn_dup.clone(), btn_ren.clone(), btn_del.clone()];
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    for b in &menu_buttons {
+    for b in [&btn_dup, &btn_ren, &btn_del] {
         b.add_css_class("flat");
         menu_box.append(b);
     }
@@ -511,59 +580,79 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
     let menu = gtk::MenuButton::new();
     menu.set_icon_name("view-more-symbolic");
     menu.set_popover(Some(&popover));
-    menu.set_tooltip_text(Some("Gerenciar perfis"));
+    menu.set_tooltip_text(Some("Duplicar, renomear ou excluir o perfil"));
+    let profile_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    profile_actions.append(&btn_new);
+    profile_actions.append(&menu);
 
-    let header = adw::HeaderBar::new();
-    header.pack_start(&profile);
-    header.pack_start(&menu);
-    header.set_title_widget(Some(&output));
-    header.pack_end(&bypass);
-    header.pack_end(&update);
+    let output_names: Vec<&str> = outputs.iter().map(|s| s.name.as_str()).collect();
+    let output = gtk::DropDown::from_strings(&output_names);
+    output.set_tooltip_text(Some("Saída de áudio"));
+    if let Some(i) = default_output
+        .as_ref()
+        .and_then(|d| outputs.iter().position(|s| s.name == d.name))
+    {
+        output.set_selected(i as u32);
+    }
+    let version = gtk::Label::new(Some(&format!(
+        "v{} · {}",
+        env!("CARGO_PKG_VERSION"),
+        BUILD_TIME
+    )));
+    version.add_css_class("version");
+    version.set_halign(gtk::Align::Start);
 
-    // ---- Curva ----
+    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    sidebar.add_css_class("sidebar-pf");
+    sidebar.set_width_request(236);
+    sidebar.append(&brand);
+    sidebar.append(&section("PERFIS"));
+    sidebar.append(&scroller);
+    sidebar.append(&profile_actions);
+    sidebar.append(&section("SAÍDA"));
+    sidebar.append(&output);
+    sidebar.append(&version);
+
+    // ---- Título + ações do perfil ----
+    let title = gtk::Label::new(None);
+    title.add_css_class("title-pf");
+    let dirty_label = gtk::Label::new(None);
+    dirty_label.add_css_class("dirty");
+    let undo = gtk::Button::with_label("Desfazer");
+    let save = gtk::Button::with_label("Salvar");
+    save.add_css_class("suggested-action");
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    top.append(&title);
+    top.append(&dirty_label);
+    top.append(&spacer);
+    top.append(&undo);
+    top.append(&save);
+
+    // ---- Curva + medidor ----
     let curve_data = Rc::new(RefCell::new(curve::CurveData::default()));
     let curve_area = curve::area(Rc::clone(&curve_data));
     let curve_card = card();
-    let t = gtk::Label::new(Some("RESPOSTA EM FREQUÊNCIA"));
-    t.add_css_class("section");
-    t.set_halign(gtk::Align::Start);
-    curve_card.append(&t);
+    curve_card.set_hexpand(true);
+    curve_card.append(&section("RESPOSTA EM FREQUÊNCIA"));
     curve_card.append(&curve_area);
+    let meter = meter::Meter::new();
+    let meter_card = card();
+    meter_card.append(&section("NÍVEL L · R"));
+    meter_card.append(&meter.area);
+    let mid = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    mid.append(&curve_card);
+    mid.append(&meter_card);
 
     // ---- Faders ----
     let faders_card = card();
-    let t = gtk::Label::new(Some("EQUALIZADOR"));
-    t.add_css_class("section");
-    t.set_halign(gtk::Align::Start);
-    faders_card.append(&t);
+    faders_card.append(&section("EQUALIZADOR"));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.set_homogeneous(false);
-
-    let column = |value: &gtk::Label, scale: &gtk::Scale, label: &gtk::Label| {
-        let c = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        c.set_hexpand(true);
-        c.set_halign(gtk::Align::Fill);
-        value.set_halign(gtk::Align::Center);
-        label.set_halign(gtk::Align::Center);
-        scale.set_halign(gtk::Align::Center);
-        c.append(value);
-        c.append(scale);
-        c.append(label);
-        c
-    };
-
-    let preamp = fader(-24.0, 6.0, Some("preamp"));
-    let preamp_value = gtk::Label::new(None);
-    preamp_value.add_css_class("db");
-    let preamp_label = gtk::Label::new(Some("PRÉ-AMP"));
-    preamp_label.add_css_class("freq");
-    row.append(&column(&preamp_value, &preamp, &preamp_label));
-    row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-
     let mut bands = Vec::new();
     let mut band_values = Vec::new();
     for band in &initial.bands {
-        let scale = fader(-12.0, 12.0, None);
+        let scale = fader();
         let value = gtk::Label::new(None);
         value.add_css_class("db");
         let label = gtk::Label::new(Some(&freq_text(band.frequency_hz)));
@@ -578,86 +667,66 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
             reset.connect_released(move |_, _, _, _| scale.set_value(0.0));
         }
         label.add_controller(reset);
-        row.append(&column(&value, &scale, &label));
+        let col = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        col.set_hexpand(true);
+        for w in [value.upcast_ref::<gtk::Widget>(), scale.upcast_ref(), label.upcast_ref()] {
+            w.set_halign(gtk::Align::Center);
+            col.append(w);
+        }
+        row.append(&col);
         bands.push(scale);
         band_values.push(value);
     }
     faders_card.append(&row);
 
-    // ---- Rodapé ----
+    // ---- Rodapé: knobs, limiter, headroom ----
     let footer = card();
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 18);
-
-    let balance = gtk::Scale::with_range(gtk::Orientation::Horizontal, -1.0, 1.0, 0.01);
-    balance.set_draw_value(false);
-    balance.set_round_digits(2);
-    balance.set_width_request(240);
-    balance.add_css_class("fader");
-    balance.add_css_class("balance");
-    balance.add_mark(0.0, gtk::PositionType::Bottom, None);
-    balance.set_tooltip_text(Some("Balanço estéreo (esquerda / direita)"));
-    let balance_l = gtk::Label::new(None);
-    let balance_r = gtk::Label::new(None);
-    balance_l.add_css_class("freq");
-    balance_r.add_css_class("freq");
-    let center = gtk::Button::with_label("Centro");
-    center.add_css_class("flat");
-    let bal_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    bal_box.append(&balance_l);
-    bal_box.append(&balance);
-    bal_box.append(&balance_r);
-    bal_box.append(&center);
-    controls.append(&bal_box);
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 28);
+    let balance = Knob::new(-1.0, 1.0, 0.0, 0.01, (0.24, 0.86, 0.72));
+    balance.widget().set_tooltip_text(Some(
+        "Balanço estéreo — arraste, role ou clique duas vezes para centralizar",
+    ));
+    let balance_text = gtk::Label::new(None);
+    let preamp = Knob::new(-24.0, 6.0, 0.0, 0.1, (0.96, 0.72, 0.24));
+    preamp.widget().set_tooltip_text(Some(
+        "Ganho geral antes do equalizador — clique duas vezes para zerar",
+    ));
+    let preamp_text = gtk::Label::new(None);
+    controls.append(&knob_column(&balance, &balance_text));
+    controls.append(&knob_column(&preamp, &preamp_text));
 
     let limiter = gtk::Switch::new();
     limiter.set_valign(gtk::Align::Center);
     limiter.set_tooltip_text(Some("Protege contra clipping no fim da cadeia"));
     let lim_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    lim_box.set_valign(gtk::Align::Center);
     lim_box.append(&gtk::Label::new(Some("Limiter")));
     lim_box.append(&limiter);
     controls.append(&lim_box);
-
     let headroom = gtk::Label::new(None);
+    headroom.set_valign(gtk::Align::Center);
     controls.append(&headroom);
-
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    controls.append(&spacer);
-
-    let dirty_label = gtk::Label::new(None);
-    let undo = gtk::Button::with_label("Desfazer");
-    let save = gtk::Button::with_label("Salvar perfil");
-    save.add_css_class("suggested-action");
-    controls.append(&dirty_label);
-    controls.append(&undo);
-    controls.append(&save);
     footer.append(&controls);
 
     let status = gtk::Label::new(None);
     status.set_halign(gtk::Align::Start);
-    status.set_hexpand(true);
     status.add_css_class("version");
-    let version = gtk::Label::new(Some(&format!(
-        "v{} · {}",
-        env!("CARGO_PKG_VERSION"),
-        BUILD_TIME
-    )));
-    version.add_css_class("version");
-    version.set_halign(gtk::Align::End);
-    let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    bottom.append(&status);
-    bottom.append(&version);
 
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    body.set_margin_top(12);
-    body.set_margin_bottom(8);
-    body.set_margin_start(14);
-    body.set_margin_end(14);
-    body.append(&curve_card);
-    body.append(&faders_card);
-    body.append(&footer);
-    body.append(&bottom);
+    let main = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    main.set_hexpand(true);
+    main.set_margin_top(12);
+    main.set_margin_bottom(8);
+    main.set_margin_start(14);
+    main.set_margin_end(14);
+    main.append(&top);
+    main.append(&mid);
+    main.append(&faders_card);
+    main.append(&footer);
+    main.append(&status);
 
+    let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    body.append(&sidebar);
+    body.append(&main);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&header);
     root.append(&body);
@@ -665,8 +734,8 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("PulseForge")
-        .default_width(1060)
-        .default_height(720)
+        .default_width(1180)
+        .default_height(760)
         .content(&root)
         .build();
     window.add_css_class("pf");
@@ -687,20 +756,20 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         apply_gen: Cell::new(0),
         balance_gen: Cell::new(0),
         outputs: outputs.iter().map(|s| s.name.clone()).collect(),
-        profile: profile.clone(),
-        profile_model,
+        list: list.clone(),
+        thumbs: RefCell::new(Vec::new()),
+        title,
         output: output.clone(),
         bypass: bypass.clone(),
         menu_buttons,
-        preamp: preamp.clone(),
-        preamp_value,
+        preamp: Rc::clone(&preamp),
+        preamp_text,
         bands: bands.clone(),
         band_values,
         limiter: limiter.clone(),
         headroom,
-        balance: balance.clone(),
-        balance_l,
-        balance_r,
+        balance_text,
+        meter,
         dirty_label,
         undo: undo.clone(),
         save: save.clone(),
@@ -710,8 +779,9 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
     });
 
     // Estado inicial dos widgets (sem disparar edições).
+    ui.reload_list(initial_idx);
     balance.set_value(balance_value);
-    ui.balance_changed();
+    ui.update_balance_text(balance_value);
     ui.push_draft_to_widgets();
     ui.loading.set(false);
     ui.refresh_view();
@@ -719,14 +789,15 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
 
     // ---- Ligações ----
     {
-        let ui = Rc::clone(&ui);
-        preamp.connect_value_changed(move |s| {
-            if ui.loading.get() {
-                return;
-            }
-            ui.draft.borrow_mut().preamp_db = s.value() as f32;
-            ui.edited();
+        let ui2 = Rc::clone(&ui);
+        preamp.on_change(move |v| {
+            ui2.draft.borrow_mut().preamp_db = v as f32;
+            ui2.edited();
         });
+    }
+    {
+        let ui2 = Rc::clone(&ui);
+        balance.on_change(move |v| ui2.balance_changed(v));
     }
     for (i, scale) in bands.iter().enumerate() {
         let ui = Rc::clone(&ui);
@@ -752,15 +823,11 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
     }
     {
         let ui = Rc::clone(&ui);
-        balance.connect_value_changed(move |_| ui.balance_changed());
-    }
-    {
-        let balance = balance.clone();
-        center.connect_clicked(move |_| balance.set_value(0.0));
-    }
-    {
-        let ui = Rc::clone(&ui);
-        profile.connect_selected_notify(move |_| ui.profile_selected());
+        list.connect_row_selected(move |_, row| {
+            if let Some(row) = row {
+                ui.profile_selected(row.index() as usize);
+            }
+        });
     }
     {
         let ui = Rc::clone(&ui);
@@ -787,12 +854,25 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         update.connect_clicked(move |b| ui.check_update(b));
     }
 
+    // ---- Medidor de nível (dados reais do monitor do sink) ----
+    {
+        let rx = meter::spawn();
+        let ui = Rc::clone(&ui);
+        gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+            let (mut l, mut r) = (0f32, 0f32);
+            while let Ok((pl, pr)) = rx.try_recv() {
+                l = l.max(pl);
+                r = r.max(pr);
+            }
+            ui.meter.push(meter::level(l), meter::level(r));
+            gtk::glib::ControlFlow::Continue
+        });
+    }
+
     // ---- Gerenciar perfis ----
     {
         let ui = Rc::clone(&ui);
-        let popover = popover.clone();
         btn_new.connect_clicked(move |_| {
-            popover.popdown();
             let ui2 = Rc::clone(&ui);
             dialogs::profile_name_dialog(&ui.window, "Novo perfil", "Meu perfil", "Criar", move |name| {
                 let id = dialogs::unique_profile_id(&ui2.config.borrow(), &name);
@@ -804,7 +884,7 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
                 if created.is_ok() {
                     let idx = ui2.config.borrow().profiles.iter().position(|p| p.id == id);
                     if let Some(idx) = idx {
-                        ui2.reload_model(idx);
+                        ui2.reload_list(idx);
                         ui2.load_profile(idx);
                     }
                 }
@@ -835,7 +915,7 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
                     if done.is_ok() {
                         let idx = ui2.config.borrow().profiles.iter().position(|p| p.id == id);
                         if let Some(idx) = idx {
-                            ui2.reload_model(idx);
+                            ui2.reload_list(idx);
                             ui2.load_profile(idx);
                         }
                     }
@@ -859,7 +939,9 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
                         .and_then(|_| crate::config::store::save(&cfg))
                 };
                 if done.is_ok() {
-                    ui2.reload_model(ui2.current.get());
+                    let idx = ui2.current.get();
+                    ui2.reload_list(idx);
+                    ui2.load_profile(idx);
                 }
             });
         });
@@ -890,7 +972,7 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
                         .and_then(|_| crate::config::store::save(&cfg))
                 };
                 if done.is_ok() {
-                    ui2.reload_model(0);
+                    ui2.reload_list(0);
                     ui2.load_profile(0);
                 }
             });

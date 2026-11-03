@@ -20,6 +20,12 @@ window.pf { background: #0f1115; color: #e6e8ec; }
 .pf .status-bad { color: #ff6b6b; }
 .pf .dirty { color: #f5b83d; font-weight: 600; }
 .pf .version { font-size: 11px; color: #5d6574; }
+.pf .sidebar-pf { background: #14171d; border-right: 1px solid #232832; padding: 14px; }
+.pf .title-pf { font-size: 18px; font-weight: 700; }
+.pf list.profiles { background: transparent; }
+.pf list.profiles row { border-radius: 9px; padding: 8px 10px; margin-bottom: 4px; border-left: 3px solid transparent; }
+.pf list.profiles row:selected { background: #222834; border-left-color: #3ddbb8; }
+.pf list.profiles row:hover:not(:selected) { background: #1a1e27; }
 .pf button.pill-pf { border-radius: 999px; padding: 4px 14px; }
 "#;
 

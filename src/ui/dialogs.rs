@@ -37,12 +37,6 @@ pub fn offer_restart(window: &adw::ApplicationWindow) {
     dialog.present();
 }
 
-pub fn refresh_profile_model(model: &gtk::StringList, config: &crate::AppConfig) {
-    let names: Vec<String> = config.profiles.iter().map(|p| p.name.clone()).collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    model.splice(0, model.n_items(), &refs);
-}
-
 pub fn unique_profile_id(config: &crate::AppConfig, name: &str) -> String {
     let base: String = name.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     let base = base.trim_matches('-').to_string();
