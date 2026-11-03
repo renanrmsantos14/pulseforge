@@ -246,6 +246,7 @@ impl Ui {
                 })
                 .collect();
         }
+        self.curve_data.borrow_mut().gains = draft.bands.iter().map(|b| f64::from(b.gain_db)).collect();
         if let Some(t) = self.thumbs.borrow().get(self.current.get()) {
             *t.points.borrow_mut() = thumb_points(&draft);
             t.area.queue_draw();
@@ -265,6 +266,27 @@ impl Ui {
                 None
             });
         }
+    }
+
+    /// Ajusta uma banda vinda do arraste na curva (mantém fader e rascunho em sincronia).
+    fn set_band(self: &Rc<Self>, band: usize, gain: f64) {
+        let Some(scale) = self.bands.get(band) else {
+            return;
+        };
+        {
+            let mut d = self.draft.borrow_mut();
+            let Some(b) = d.bands.get_mut(band) else {
+                return;
+            };
+            if (f64::from(b.gain_db) - gain).abs() < 1e-6 {
+                return;
+            }
+            b.gain_db = gain as f32;
+        }
+        self.loading.set(true);
+        scale.set_value(gain);
+        self.loading.set(false);
+        self.edited();
     }
 
     fn update_balance_text(&self, v: f64) {
@@ -631,8 +653,17 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
     top.append(&save);
 
     // ---- Curva + medidor ----
+    let curve_ui: Rc<RefCell<Option<Rc<Ui>>>>;
     let curve_data = Rc::new(RefCell::new(curve::CurveData::default()));
-    let curve_area = curve::area(Rc::clone(&curve_data));
+    let curve_area = {
+        let slot: Rc<RefCell<Option<Rc<Ui>>>> = Rc::new(RefCell::new(None));
+        curve_ui = Rc::clone(&slot);
+        curve::area(Rc::clone(&curve_data), move |band, gain| {
+            if let Some(ui) = slot.borrow().as_ref() {
+                ui.set_band(band, gain);
+            }
+        })
+    };
     let curve_card = card();
     curve_card.set_hexpand(true);
     curve_card.append(&section("RESPOSTA EM FREQUÊNCIA"));
@@ -777,6 +808,8 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         curve_data,
         curve_area,
     });
+
+    *curve_ui.borrow_mut() = Some(Rc::clone(&ui));
 
     // Estado inicial dos widgets (sem disparar edições).
     ui.reload_list(initial_idx);
