@@ -105,7 +105,7 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
     if let Some(current_profile) = config.borrow().profiles.get(selected_index as usize) {
         let output_name = default_output.as_ref().map(|sink| sink.name.as_str());
         if let Ok(mut service) = crate::audio::service::FilterService::new() {
-            let _ = service.start_for_output(current_profile, output_name);
+            let _ = service.apply(current_profile, output_name, f64::from(config.borrow().balance));
         }
     }
 
@@ -307,10 +307,12 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let balance_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let left_label = gtk::Label::new(Some("L 100%"));
-    let right_label = gtk::Label::new(Some("R 100%"));
+    let initial_balance = f64::from(config.borrow().balance);
+    let (initial_left, initial_right) = crate::audio::service::balance_gains(initial_balance);
+    let left_label = gtk::Label::new(Some(&format!("L {}%", (initial_left * 100.0).round() as i32)));
+    let right_label = gtk::Label::new(Some(&format!("R {}%", (initial_right * 100.0).round() as i32)));
     let balance = gtk::Scale::with_range(gtk::Orientation::Horizontal, -1.0, 1.0, 0.01);
-    balance.set_value(0.0);
+    balance.set_value(initial_balance);
     balance.set_width_request(180);
     balance.set_tooltip_text(Some("Balanço estéreo: L / R"));
     balance_box.append(&left_label);
@@ -318,6 +320,7 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
     balance_box.append(&right_label);
     let left_label_live = left_label.clone();
     let right_label_live = right_label.clone();
+    let balance_config = Rc::clone(&config);
     balance.connect_value_changed(move |slider| {
         let (left, right) = crate::audio::service::balance_gains(slider.value());
         let left_percent = (left * 100.0).round() as i32;
@@ -327,6 +330,9 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         if let Ok(service) = crate::audio::service::FilterService::new() {
             let _ = service.set_balance(slider.value());
         }
+        let mut cfg = balance_config.borrow_mut();
+        cfg.balance = slider.value() as f32;
+        let _ = crate::config::store::save(&cfg);
     });
     controls.append(&balance_box);
     controls.append(&limiter);
@@ -345,8 +351,17 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
                 button.set_label("Bypass active");
             } else {
                 let selected = profile.selected() as usize;
-                if let Some(current) = config.borrow().profiles.get(selected) {
-                    let _ = service.start(current);
+                let output = crate::audio::system::PactlBackend::default()
+                    .default_output()
+                    .ok()
+                    .flatten();
+                let config = config.borrow();
+                if let Some(current) = config.profiles.get(selected) {
+                    let _ = service.apply(
+                        current,
+                        output.as_ref().map(|sink| sink.name.as_str()),
+                        f64::from(config.balance),
+                    );
                 }
                 button.set_label("Bypass");
             }
@@ -434,6 +449,7 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         save.connect_clicked(move |button| {
             let mut config = config.borrow_mut();
             let selected = profile.selected() as usize;
+            let balance = f64::from(config.balance);
             if let Some(target) = config.profiles.get_mut(selected) {
                 for (band, slider) in target.bands.iter_mut().zip(sliders.borrow().iter()) {
                     band.gain_db = slider.value() as f32;
@@ -444,7 +460,7 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
                     .get(output.selected() as usize)
                     .map(String::as_str);
                 match crate::audio::service::FilterService::new()
-                    .and_then(|mut service| service.start_for_output(target, output_name))
+                    .and_then(|mut service| service.apply(target, output_name, balance))
                     .and_then(|_| crate::config::store::save(&config))
                 {
                     Ok(()) => button.set_label("Saved ✓"),
@@ -627,6 +643,7 @@ fn apply_live(
 ) -> anyhow::Result<()> {
     let mut config = config.borrow_mut();
     let selected = profile.selected() as usize;
+    let balance = f64::from(config.balance);
     let current = config
         .profiles
         .get_mut(selected)
@@ -640,7 +657,7 @@ fn apply_live(
         .get(output.selected() as usize)
         .map(String::as_str);
     let mut service = crate::audio::service::FilterService::new()?;
-    service.start_for_output(current, output_name)
+    service.apply(current, output_name, balance)
 }
 
 fn schedule_live(

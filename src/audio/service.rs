@@ -1,8 +1,15 @@
-use crate::audio::pipewire_config::filter_chain_for_output;
+use crate::audio::pipewire_config::{
+    balance_params, filter_chain_with_balance, live_params, skeleton, SKELETON_PREFIX,
+};
 use crate::config::model::Profile;
 use anyhow::{Context, Result};
 use directories::BaseDirs;
 use std::{fs, path::PathBuf, process::Command};
+
+pub use crate::audio::pipewire_config::balance_gains;
+
+const SINK: &str = "pulseforge";
+const UNIT: &str = "filter-chain.service";
 
 pub struct FilterService {
     config_path: PathBuf,
@@ -21,53 +28,70 @@ impl FilterService {
     }
 
     pub fn is_running(&mut self) -> bool {
-        Command::new("systemctl")
-            .args(["--user", "is-active", "--quiet", "filter-chain.service"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        systemctl_ok(&["is-active", "--quiet", UNIT])
     }
 
     pub fn config_path(&self) -> &std::path::Path {
         &self.config_path
     }
 
-    pub fn start(&mut self, profile: &Profile) -> Result<()> {
-        self.start_for_output(profile, None)
+    /// Applies a profile (+ balance). If the graph structure did not change
+    /// and the filter is running, values are updated live in PipeWire (no
+    /// audio dropout, volume and routing untouched); otherwise the
+    /// filter-chain is restarted.
+    pub fn apply(&mut self, profile: &Profile, output: Option<&str>, balance: f64) -> Result<()> {
+        let unchanged = self.stored_skeleton().as_deref() == Some(skeleton(profile, output).as_str());
+        self.write_config(&filter_chain_with_balance(profile, output, balance))?;
+        if unchanged && self.is_running() && set_params(&live_params(profile, balance)).is_ok() {
+            return Ok(());
+        }
+        self.restart()
     }
 
-    pub fn start_for_output(&mut self, profile: &Profile, output: Option<&str>) -> Result<()> {
-        // Recriar o sink zera o volume/balanço; guardamos L/R para restaurar depois.
-        let previous = self.channel_volumes();
-        fs::write(&self.config_path, filter_chain_for_output(profile, output))?;
+    /// Updates only the stereo balance, live. Needs a running filter.
+    pub fn set_balance(&self, balance: f64) -> Result<()> {
+        set_params(&balance_params(balance))
+    }
+
+    pub fn stop(&mut self) {
         let _ = Command::new("systemctl")
-            .args(["--user", "reset-failed", "filter-chain.service"])
+            .args(["--user", "stop", UNIT])
             .status();
-        let status = Command::new("systemctl")
-            .args(["--user", "restart", "filter-chain.service"])
-            .status()
-            .context("failed to restart filter-chain.service")?;
-        if !status.success() {
+    }
+
+    fn stored_skeleton(&self) -> Option<String> {
+        let text = fs::read_to_string(&self.config_path).ok()?;
+        text.lines()
+            .next()?
+            .strip_prefix(SKELETON_PREFIX)
+            .map(str::to_owned)
+    }
+
+    fn write_config(&self, text: &str) -> Result<()> {
+        let tmp = self.config_path.with_extension("conf.tmp");
+        fs::write(&tmp, text)?;
+        fs::rename(&tmp, &self.config_path)?;
+        Ok(())
+    }
+
+    fn restart(&mut self) -> Result<()> {
+        // Recreating the sink resets its volume; keep it to restore afterwards.
+        let previous = sink_volumes();
+        let _ = systemctl_ok(&["reset-failed", UNIT]);
+        if !systemctl_ok(&["restart", UNIT]) {
             anyhow::bail!("filter-chain.service restart failed");
         }
-        for _ in 0..20 {
-            let service_active = Command::new("systemctl")
-                .args(["--user", "is-active", "--quiet", "filter-chain.service"])
-                .status()
-                .map(|result| result.success())
-                .unwrap_or(false);
+        for _ in 0..40 {
             let sink_ready = Command::new("pactl")
                 .args(["list", "short", "sinks"])
                 .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).contains("pulseforge"))
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(SINK))
                 .unwrap_or(false);
-            if service_active && sink_ready {
-                let _ = Command::new("pactl")
-                    .args(["set-default-sink", "pulseforge"])
-                    .status();
+            if sink_ready && systemctl_ok(&["is-active", "--quiet", UNIT]) {
+                let _ = Command::new("pactl").args(["set-default-sink", SINK]).status();
                 if let Some((left, right)) = previous {
                     let _ = Command::new("pactl")
-                        .args(["set-sink-volume", "pulseforge", &format!("{left}%"), &format!("{right}%")])
+                        .args(["set-sink-volume", SINK, &format!("{left}%"), &format!("{right}%")])
                         .status();
                 }
                 return Ok(());
@@ -76,54 +100,53 @@ impl FilterService {
         }
         anyhow::bail!("filter-chain.service did not become active")
     }
-
-    pub fn stop(&mut self) {
-        let _ = Command::new("systemctl")
-            .args(["--user", "stop", "filter-chain.service"])
-            .status();
-    }
-
-    /// Applies stereo balance to the local PulseForge sink without changing the
-    /// overall volume. `balance` is in [-1, 1]: negative favors left, positive
-    /// favors right. The louder channel keeps the current sink volume.
-    pub fn set_balance(&self, balance: f64) -> Result<()> {
-        let balance = balance.clamp(-1.0, 1.0);
-        let (left, right) = balance_gains(balance);
-        let base = self.current_volume_percent().unwrap_or(100.0);
-        let left = format!("{:.0}%", base * left);
-        let right = format!("{:.0}%", base * right);
-        let status = Command::new("pactl")
-            .args(["set-sink-volume", "pulseforge", &left, &right])
-            .status()
-            .context("failed to set PulseForge stereo balance")?;
-        if !status.success() {
-            anyhow::bail!("unable to set PulseForge stereo balance");
-        }
-        Ok(())
-    }
-
-    /// Volume (%) of the left and right channels of the PulseForge sink.
-    fn channel_volumes(&self) -> Option<(u32, u32)> {
-        let out = Command::new("pactl")
-            .args(["get-sink-volume", "pulseforge"])
-            .output()
-            .ok()?;
-        parse_channel_volumes(&String::from_utf8_lossy(&out.stdout))
-    }
-
-    /// Master volume of the sink: the loudest channel, in percent.
-    fn current_volume_percent(&self) -> Option<f64> {
-        self.channel_volumes().map(|(l, r)| f64::from(l.max(r)))
-    }
 }
 
-/// Per-channel gain factors (left, right) for a balance in [-1, 1].
-pub fn balance_gains(balance: f64) -> (f64, f64) {
-    let balance = balance.clamp(-1.0, 1.0);
-    (
-        if balance > 0.0 { 1.0 - balance } else { 1.0 },
-        if balance < 0.0 { 1.0 + balance } else { 1.0 },
-    )
+fn systemctl_ok(args: &[&str]) -> bool {
+    Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Id of the PipeWire node of the PulseForge sink (where the controls live).
+fn node_id() -> Option<String> {
+    let out = Command::new("pw-cli").args(["ls", "Node"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("id ") {
+            current = rest.split(',').next().map(str::to_owned);
+        } else if line == format!("node.name = \"{SINK}\"") {
+            return current;
+        }
+    }
+    None
+}
+
+/// Sets filter controls on the running graph without restarting it.
+fn set_params(params: &[(String, f32)]) -> Result<()> {
+    let id = node_id().context("sink do PulseForge não encontrado no PipeWire")?;
+    let list: Vec<String> = params
+        .iter()
+        .map(|(name, value)| format!("\"{name}\" {value:.6}"))
+        .collect();
+    let status = Command::new("pw-cli")
+        .args(["s", &id, "Props", &format!("{{ params = [ {} ] }}", list.join(" "))])
+        .output()
+        .context("pw-cli indisponível")?;
+    if !status.status.success() || !status.stderr.is_empty() {
+        anyhow::bail!("pw-cli não aplicou os parâmetros");
+    }
+    Ok(())
+}
+
+/// Volume (%) of the left and right channels of the PulseForge sink.
+fn sink_volumes() -> Option<(u32, u32)> {
+    let out = Command::new("pactl").args(["get-sink-volume", SINK]).output().ok()?;
+    parse_channel_volumes(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Extrai as porcentagens (L, R) da saída de `pactl get-sink-volume`.

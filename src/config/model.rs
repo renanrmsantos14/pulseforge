@@ -38,6 +38,9 @@ pub struct AppConfig {
     pub profiles: Vec<Profile>,
     pub output_rules: Vec<OutputRule>,
     pub fallback_profile_id: String,
+    /// Balanço estéreo global em [-1, 1] (negativo favorece L, positivo R).
+    #[serde(default)]
+    pub balance: f32,
 }
 
 impl Default for AppConfig {
@@ -93,6 +96,7 @@ impl Default for AppConfig {
             profiles: vec![flat, bass, vocal, night, headphones, flow_xa],
             output_rules: vec![],
             fallback_profile_id: "flat".into(),
+            balance: 0.0,
         }
     }
 }
