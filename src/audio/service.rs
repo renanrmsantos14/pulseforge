@@ -4,12 +4,14 @@ use crate::audio::pipewire_config::{
 use crate::config::model::Profile;
 use anyhow::{Context, Result};
 use directories::BaseDirs;
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command, sync::Mutex};
 
 pub use crate::audio::pipewire_config::balance_gains;
 
 const SINK: &str = "pulseforge";
 const UNIT: &str = "filter-chain.service";
+/// Serializa alterações (UI, CLI em threads) sobre o mesmo arquivo/serviço.
+static APPLY_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct FilterService {
     config_path: PathBuf,
@@ -40,6 +42,7 @@ impl FilterService {
     /// audio dropout, volume and routing untouched); otherwise the
     /// filter-chain is restarted.
     pub fn apply(&mut self, profile: &Profile, output: Option<&str>, balance: f64) -> Result<()> {
+        let _guard = APPLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unchanged = self.stored_skeleton().as_deref() == Some(skeleton(profile, output).as_str());
         self.write_config(&filter_chain_with_balance(profile, output, balance))?;
         if unchanged && self.is_running() && set_params(&live_params(profile, balance)).is_ok() {
