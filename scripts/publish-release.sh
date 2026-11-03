@@ -10,5 +10,6 @@ cargo build --release --features gui
 asset="$(mktemp -d)/pulseforge-linux-x86_64"
 install -m 0755 target/release/pulseforge "$asset"
 git push origin HEAD
-gh release create "v$version" "$asset" --title "PulseForge $version" --generate-notes
+gh release create "v$version" --title "PulseForge $version" --generate-notes
+for tentativa in 1 2 3 4; do gh release upload "v$version" "$asset" --clobber && break; sleep 2; done
 echo "Release v$version publicada."
