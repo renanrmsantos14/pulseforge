@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PulseForge
+Comment=Personal PipeWire equalizer
+Exec=pulseforge --gui --start-minimized
+Terminal=false
+X-GNOME-Autostart-enabled=true
+Categories=AudioVideo;Audio;
+Icon=pulseforge

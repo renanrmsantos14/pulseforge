@@ -1,0 +1,26 @@
+[package]
+name = "pulseforge"
+version = "0.1.40"
+edition = "2021"
+
+[features]
+default = []
+gui = ["dep:gtk4", "dep:libadwaita", "dep:ksni"]
+
+[dependencies]
+anyhow = "1"
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+gtk4 = { version = "0.9", optional = true }
+libadwaita = { version = "0.7", features = ["v1_2"], optional = true }
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"], optional = true }
+
+[lib]
+name = "pulseforge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pulseforge"
+path = "src/main.rs"
