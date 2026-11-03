@@ -37,6 +37,8 @@ impl FilterService {
     }
 
     pub fn start_for_output(&mut self, profile: &Profile, output: Option<&str>) -> Result<()> {
+        // Recriar o sink zera o volume/balanço; guardamos L/R para restaurar depois.
+        let previous = self.channel_volumes();
         fs::write(&self.config_path, filter_chain_for_output(profile, output))?;
         let _ = Command::new("systemctl")
             .args(["--user", "reset-failed", "filter-chain.service"])
@@ -63,6 +65,11 @@ impl FilterService {
                 let _ = Command::new("pactl")
                     .args(["set-default-sink", "pulseforge"])
                     .status();
+                if let Some((left, right)) = previous {
+                    let _ = Command::new("pactl")
+                        .args(["set-sink-volume", "pulseforge", &format!("{left}%"), &format!("{right}%")])
+                        .status();
+                }
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -95,16 +102,18 @@ impl FilterService {
         Ok(())
     }
 
-    /// Master volume of the sink: the loudest channel, in percent.
-    fn current_volume_percent(&self) -> Option<f64> {
+    /// Volume (%) of the left and right channels of the PulseForge sink.
+    fn channel_volumes(&self) -> Option<(u32, u32)> {
         let out = Command::new("pactl")
             .args(["get-sink-volume", "pulseforge"])
             .output()
             .ok()?;
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .filter_map(|t| t.strip_suffix('%')?.parse::<f64>().ok())
-            .fold(None, |max, v| Some(max.map_or(v, |m: f64| m.max(v))))
+        parse_channel_volumes(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Master volume of the sink: the loudest channel, in percent.
+    fn current_volume_percent(&self) -> Option<f64> {
+        self.channel_volumes().map(|(l, r)| f64::from(l.max(r)))
     }
 }
 
@@ -115,4 +124,13 @@ pub fn balance_gains(balance: f64) -> (f64, f64) {
         if balance > 0.0 { 1.0 - balance } else { 1.0 },
         if balance < 0.0 { 1.0 + balance } else { 1.0 },
     )
+}
+
+/// Extrai as porcentagens (L, R) da saída de `pactl get-sink-volume`.
+pub fn parse_channel_volumes(text: &str) -> Option<(u32, u32)> {
+    let mut values = text
+        .split_whitespace()
+        .filter_map(|t| t.strip_suffix('%')?.parse::<u32>().ok());
+    let left = values.next()?;
+    Some((left, values.next().unwrap_or(left)))
 }
