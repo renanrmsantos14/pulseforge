@@ -41,6 +41,22 @@ pub struct AppConfig {
     /// Balanço estéreo global em [-1, 1] (negativo favorece L, positivo R).
     #[serde(default)]
     pub balance: f32,
+    /// Ao iniciar, abre o último perfil usado em vez do padrão.
+    #[serde(default)]
+    pub remember_last_profile: bool,
+    #[serde(default)]
+    pub last_profile_id: Option<String>,
+}
+
+impl AppConfig {
+    /// Índice do último perfil usado, se "lembrar último" estiver ativo e ele ainda existir.
+    pub fn remembered_profile(&self) -> Option<usize> {
+        let id = self
+            .last_profile_id
+            .as_deref()
+            .filter(|_| self.remember_last_profile)?;
+        self.profiles.iter().position(|p| p.id == id)
+    }
 }
 
 impl Default for AppConfig {
@@ -97,6 +113,8 @@ impl Default for AppConfig {
             output_rules: vec![],
             fallback_profile_id: "flat".into(),
             balance: 0.0,
+            remember_last_profile: false,
+            last_profile_id: None,
         }
     }
 }

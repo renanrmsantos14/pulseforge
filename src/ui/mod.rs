@@ -68,6 +68,7 @@ struct Ui {
     output: gtk::DropDown,
     bypass: gtk::ToggleButton,
     menu_buttons: Vec<gtk::Button>,
+    set_default: gtk::Button,
 
     preamp: Rc<Knob>,
     preamp_text: gtk::Label,
@@ -254,6 +255,14 @@ impl Ui {
         drop(draft);
         self.curve_area.queue_draw();
 
+        let is_default = {
+            let cfg = self.config.borrow();
+            cfg.profiles
+                .get(self.current.get())
+                .is_some_and(|p| p.id == cfg.fallback_profile_id)
+        };
+        self.set_default.set_sensitive(!is_default);
+
         let dirty = self.dirty();
         self.dirty_label.set_text(if dirty { "● não salvo" } else { "" });
         self.undo.set_sensitive(dirty);
@@ -317,10 +326,39 @@ impl Ui {
             return;
         };
         self.current.set(index);
+        self.remember_current(&profile.id);
         *self.draft.borrow_mut() = profile;
         self.push_draft_to_widgets();
         self.refresh_view();
         self.apply_now();
+    }
+
+    /// Guarda o perfil em uso para reabri-lo na próxima inicialização.
+    fn remember_current(&self, id: &str) {
+        let mut cfg = self.config.borrow_mut();
+        if cfg.last_profile_id.as_deref() != Some(id) {
+            cfg.last_profile_id = Some(id.into());
+            let _ = crate::config::store::save(&cfg);
+        }
+    }
+
+    fn set_current_as_default(&self) {
+        let result = {
+            let mut cfg = self.config.borrow_mut();
+            let Some(id) = cfg.profiles.get(self.current.get()).map(|p| p.id.clone()) else {
+                return;
+            };
+            cfg.fallback_profile_id = id;
+            crate::config::store::save(&cfg)
+        };
+        match result {
+            Ok(()) => {
+                self.reload_list(self.current.get());
+                self.refresh_view();
+                self.set_status(true, "● Perfil definido como padrão");
+            }
+            Err(e) => self.set_status(false, &format!("● Falha ao salvar: {e}")),
+        }
     }
 
     fn select_row(&self, index: usize) {
@@ -336,10 +374,20 @@ impl Ui {
             self.list.remove(&row);
         }
         let mut thumbs = Vec::new();
-        for p in &self.config.borrow().profiles {
+        let cfg = self.config.borrow();
+        for p in &cfg.profiles {
             let points: Points = Rc::new(RefCell::new(thumb_points(p)));
             let area = thumb_area(Rc::clone(&points));
-            let name = gtk::Label::new(Some(&p.name));
+            let is_default = p.id == cfg.fallback_profile_id;
+            let text = if is_default {
+                format!("★ {}", p.name)
+            } else {
+                p.name.clone()
+            };
+            let name = gtk::Label::new(Some(&text));
+            if is_default {
+                name.set_tooltip_text(Some("Perfil padrão ao iniciar"));
+            }
             name.set_halign(gtk::Align::Start);
             name.set_ellipsize(gtk::pango::EllipsizeMode::End);
             let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -348,6 +396,7 @@ impl Ui {
             self.list.append(&content);
             thumbs.push(Thumb { points, area });
         }
+        drop(cfg);
         *self.thumbs.borrow_mut() = thumbs;
         self.list.select_row(self.list.row_at_index(select as i32).as_ref());
         self.loading.set(false);
@@ -545,18 +594,24 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         .collect();
     let default_output = backend.default_output().ok().flatten();
 
-    let initial_idx = default_output
-        .as_ref()
-        .and_then(|sink| {
-            crate::output_rules::match_profile(
-                sink,
-                &config.output_rules,
-                &config.profiles,
-                &config.fallback_profile_id,
-            )
-        })
-        .and_then(|p| config.profiles.iter().position(|x| x.id == p.id))
+    let by_output = || {
+        default_output
+            .as_ref()
+            .and_then(|sink| {
+                crate::output_rules::match_profile(
+                    sink,
+                    &config.output_rules,
+                    &config.profiles,
+                    &config.fallback_profile_id,
+                )
+            })
+            .and_then(|p| config.profiles.iter().position(|x| x.id == p.id))
+    };
+    let initial_idx = config
+        .remembered_profile()
+        .or_else(by_output)
         .unwrap_or(0);
+    let remember_last = config.remember_last_profile;
     let initial = config
         .profiles
         .get(initial_idx)
@@ -597,12 +652,20 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         b.add_css_class("flat");
         menu_box.append(b);
     }
+    menu_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let set_default = gtk::Button::with_label("Definir como padrão");
+    set_default.add_css_class("flat");
+    set_default.set_tooltip_text(Some("Perfil usado ao iniciar o PulseForge"));
+    menu_box.append(&set_default);
+    let remember = gtk::CheckButton::with_label("Ao iniciar, usar o último perfil");
+    remember.set_active(remember_last);
+    menu_box.append(&remember);
     let popover = gtk::Popover::new();
     popover.set_child(Some(&menu_box));
     let menu = gtk::MenuButton::new();
     menu.set_icon_name("view-more-symbolic");
     menu.set_popover(Some(&popover));
-    menu.set_tooltip_text(Some("Duplicar, renomear ou excluir o perfil"));
+    menu.set_tooltip_text(Some("Duplicar, renomear, excluir ou definir o perfil inicial"));
     let profile_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     profile_actions.append(&btn_new);
     profile_actions.append(&menu);
@@ -793,6 +856,7 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
         output: output.clone(),
         bypass: bypass.clone(),
         menu_buttons,
+        set_default: set_default.clone(),
         preamp: Rc::clone(&preamp),
         preamp_text,
         bands: bands.clone(),
@@ -903,6 +967,31 @@ fn build_window(app: &adw::Application, start_minimized: bool) {
     }
 
     // ---- Gerenciar perfis ----
+    {
+        let ui = Rc::clone(&ui);
+        let popover = popover.clone();
+        set_default.connect_clicked(move |_| {
+            popover.popdown();
+            ui.set_current_as_default();
+        });
+    }
+    {
+        let ui = Rc::clone(&ui);
+        remember.connect_toggled(move |c| {
+            let result = {
+                let mut cfg = ui.config.borrow_mut();
+                cfg.remember_last_profile = c.is_active();
+                crate::config::store::save(&cfg)
+            };
+            match result {
+                Ok(()) if c.is_active() => {
+                    ui.set_status(true, "● Ao iniciar: último perfil usado")
+                }
+                Ok(()) => ui.set_status(true, "● Ao iniciar: perfil padrão (★)"),
+                Err(e) => ui.set_status(false, &format!("● Falha ao salvar: {e}")),
+            }
+        });
+    }
     {
         let ui = Rc::clone(&ui);
         btn_new.connect_clicked(move |_| {

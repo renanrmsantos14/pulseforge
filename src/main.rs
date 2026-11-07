@@ -42,9 +42,14 @@ fn main() {
     }
     let config = pulseforge::config::store::load().unwrap_or_else(|_| AppConfig::default());
     let active = config
-        .profiles
-        .iter()
-        .find(|p| p.id == config.fallback_profile_id)
+        .remembered_profile()
+        .and_then(|i| config.profiles.get(i))
+        .or_else(|| {
+            config
+                .profiles
+                .iter()
+                .find(|p| p.id == config.fallback_profile_id)
+        })
         .unwrap_or(&config.profiles[0]);
     if args.iter().any(|arg| arg == "--start-filter") {
         let backend = PactlBackend::default();
